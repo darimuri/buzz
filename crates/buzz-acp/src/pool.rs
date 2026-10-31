@@ -1355,6 +1355,8 @@ pub async fn run_prompt_task(
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
+    let mut delivery = Err("not_human_turn");
+    let mut replay_blocked = false;
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
@@ -1381,12 +1383,77 @@ pub async fn run_prompt_task(
     // metadata now, before the agent is moved into PromptResult. It must be
     // declared before `liveness_guard`: Rust drops locals in reverse order, so
     // liveness is aborted before completion makes the turn terminal.
-    let _turn_guard = TurnCompletionGuard::new(
+    let turn_guard = TurnCompletionGuard::new(
         agent.acp.observer_handle(),
         agent.acp.observer_agent_index(),
         observer_channel_id,
         turn_id.clone(),
     );
+
+    // Reserve and snapshot before ANY initial/session prompt can run model/tools.
+    // A previously persisted batch must not be replayed even after process failure.
+    let mut stable_trigger_ids = triggering_event_ids.clone();
+    stable_trigger_ids.sort();
+    if let Some(b) = &batch {
+        let channel_info = ctx.channel_info.resolve(b.channel_id).await;
+        let profile_lookup = fetch_prompt_profile_lookup(b, None, &ctx.rest_client).await;
+        delivery = match crate::queue::fallback_destination(
+            b,
+            channel_info.as_ref(),
+            profile_lookup.as_ref(),
+            ctx.agent_owner_pubkey,
+        ) {
+            Ok(destination) => {
+                let identity = format!(
+                    "{}:{}:{:?}",
+                    ctx.agent_keys.public_key(),
+                    b.channel_id,
+                    stable_trigger_ids
+                );
+                let reservation =
+                    std::env::var_os("HOME")
+                        .ok_or("home_unavailable")
+                        .and_then(|home| {
+                            reply_delivery::Reservation::acquire(
+                                &std::path::PathBuf::from(home).join(".buzz-acp-reply-delivery-v1"),
+                                &identity,
+                            )
+                        });
+                match reservation {
+                    Ok(reservation) => {
+                        reply_delivery::Delivery::begin(
+                            &reply_delivery::Bridge(&ctx.rest_client),
+                            destination,
+                            &ctx.agent_keys,
+                            reservation,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        replay_blocked = e == "reserved_or_journal_failed";
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        };
+    }
+    if replay_blocked {
+        agent.acp.observe("reply_delivery", serde_json::json!({"status":"uncertain", "reason":"persisted_reservation_requires_reconciliation"}));
+        turn_guard
+            .delivery_recorded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(target: "pool::delivery", "reply delivery uncertain: persisted reservation; model/tools not replayed");
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Ok(StopReason::Cancelled),
+            None,
+        );
+        return;
+    }
 
     // Start liveness with `turn_started`, not the final session/prompt call:
     // session creation, context fetches, and an initial message can themselves
@@ -2083,6 +2150,35 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+            let final_text = agent
+                .acp
+                .take_final_reply(stop_reason == StopReason::EndTurn);
+            let delivery_outcome = match delivery {
+                Ok(delivery) => {
+                    delivery
+                        .finish(
+                            &reply_delivery::Bridge(&ctx.rest_client),
+                            &ctx.agent_keys,
+                            final_text,
+                        )
+                        .await
+                }
+                Err(
+                    reason @ ("not_human_turn"
+                    | "agent_only"
+                    | "silent_or_broadcast"
+                    | "not_message"),
+                ) => reply_delivery::Outcome::Suppressed(reason),
+                Err(reason) => reply_delivery::Outcome::Uncertain(reason),
+            };
+            agent.acp.observe(
+                "reply_delivery",
+                serde_json::json!({"outcome":format!("{delivery_outcome:?}")}),
+            );
+            turn_guard
+                .delivery_recorded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(target: "pool::delivery", ?delivery_outcome, "terminal reply delivery outcome (independent of model outcome)");
 
             let should_rotate = matches!(
                 stop_reason,
@@ -3546,6 +3642,7 @@ impl Drop for LivenessGuard {
 // the agent is moved into `PromptResult`.
 
 struct TurnCompletionGuard {
+    delivery_recorded: std::sync::atomic::AtomicBool,
     observer: Option<observer::ObserverHandle>,
     agent_index: Option<usize>,
     channel_id: Option<uuid::Uuid>,
@@ -3560,6 +3657,7 @@ impl TurnCompletionGuard {
         turn_id: String,
     ) -> Self {
         Self {
+            delivery_recorded: std::sync::atomic::AtomicBool::new(false),
             observer,
             agent_index,
             channel_id,
@@ -3572,12 +3670,24 @@ impl Drop for TurnCompletionGuard {
     fn drop(&mut self) {
         if let Some(observer) = self.observer.take() {
             let context = observer::context_for(self.channel_id, None, Some(self.turn_id.clone()));
+            if !self
+                .delivery_recorded
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                observer.emit("reply_delivery", self.agent_index, &context, serde_json::json!({"status":"failed_or_uncertain", "reason":"no_terminal_delivery_receipt"}));
+            }
             observer.emit(
                 "turn_completed",
                 self.agent_index,
                 &context,
-                serde_json::json!({}),
+                serde_json::json!({"deliveryReceiptRecorded":self.delivery_recorded.load(std::sync::atomic::Ordering::Relaxed)}),
             );
+        }
+        if !self
+            .delivery_recorded
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(target: "pool::delivery", turn_id = %self.turn_id, "reply delivery failed/uncertain: no terminal receipt");
         }
     }
 }
@@ -6860,5 +6970,378 @@ mod tests {
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
         server.abort();
+    }
+}
+
+/// Bounded, positively verified delivery of a final ACP reply.
+pub mod reply_delivery {
+    use std::collections::HashSet;
+    use std::future::Future;
+    use std::io::Write;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use base64::Engine;
+    use nostr::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    /// A destination resolved from trusted input, never assistant prose.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Destination {
+        /// Accepted channel UUID (including top-level DMs).
+        pub channel: Uuid,
+        /// Original thread root, or no root for a top-level DM.
+        pub root: Option<EventId>,
+        /// Human thread anchor or DM parent.
+        pub parent: Option<EventId>,
+    }
+
+    impl Destination {
+        fn matches(&self, e: &Event) -> bool {
+            let channels: Vec<_> = e.tags.iter().filter(|t| t.as_slice()[0] == "h").collect();
+            if channels.len() != 1
+                || channels[0].as_slice().get(1) != Some(&self.channel.to_string())
+            {
+                return false;
+            }
+            let mut root = None;
+            let mut parent = None;
+            for t in e.tags.iter() {
+                let t = t.as_slice();
+                if t[0] == "broadcast" || t[0] == "silent" {
+                    return false;
+                }
+                if t[0] == "e" {
+                    let Some(id) = t.get(1).and_then(|x| EventId::from_hex(x).ok()) else {
+                        return false;
+                    };
+                    let slot = match t.get(3).map(String::as_str) {
+                        Some("root") => &mut root,
+                        Some("reply") => &mut parent,
+                        _ => return false,
+                    };
+                    if slot.replace(id).is_some() {
+                        return false;
+                    }
+                }
+            }
+            root.or(parent) == self.root && parent == self.parent
+        }
+
+        fn build(&self, text: &str, keys: &Keys) -> Result<Event, &'static str> {
+            let thread = self
+                .root
+                .zip(self.parent)
+                .map(|(root_event_id, parent_event_id)| buzz_sdk::ThreadRef {
+                    root_event_id,
+                    parent_event_id,
+                });
+            buzz_sdk::builders::build_message(self.channel, text, thread.as_ref(), &[], false, &[])
+                .map_err(|_| "event_build_failed")?
+                .sign_with_keys(keys)
+                .map_err(|_| "event_sign_failed")
+        }
+    }
+
+    /// Observable delivery result, separate from the model's stop reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Outcome {
+        /// Intentional background or agent-only work is outside fallback delivery.
+        Suppressed(&'static str),
+        /// A real accepted reply from this turn was found by authenticated query.
+        Existing(EventId),
+        /// The exact signed fallback was positively accepted or read back.
+        Accepted(EventId),
+        /// Explicit empty/silence final, with no publication.
+        Silent,
+        /// A known rejection or unsafe capture; nothing further may be sent.
+        Failed(&'static str),
+        /// An ambiguous relay or process outcome requires reconciliation.
+        Uncertain(&'static str),
+    }
+
+    /// Boxed transport operation; test transports need no live relay or keys.
+    pub type Operation<'a> = Pin<Box<dyn Future<Output = Result<Value, &'static str>> + Send + 'a>>;
+
+    /// Authenticated, bounded relay interface. Query results must be complete up to the cap.
+    pub trait Transport {
+        /// Read signed events matching a fixed filter.
+        fn query(&self, filter: Value) -> Operation<'_>;
+        /// Submit exactly this immutable signed event once.
+        fn submit(&self, event: &Event) -> Operation<'_>;
+    }
+
+    pub(crate) struct Bridge<'a>(pub &'a crate::relay::RestClient);
+
+    impl Bridge<'_> {
+        async fn post(&self, path: &str, value: Value) -> Result<Value, &'static str> {
+            let body = serde_json::to_vec(&value).map_err(|_| "encode_failed")?;
+            let url = format!("{}{}", self.0.base_url, path);
+            let tags = vec![
+                Tag::parse(["u", url.as_str()]),
+                Tag::parse(["method", "POST"]),
+                Tag::parse(["nonce", &Uuid::new_v4().to_string()]),
+                Tag::parse(["payload", &hex::encode(Sha256::digest(&body))]),
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "auth_failed")?;
+            let auth = EventBuilder::new(Kind::HttpAuth, "")
+                .tags(tags)
+                .sign_with_keys(&self.0.keys)
+                .map_err(|_| "auth_failed")?;
+            let auth = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&auth).map_err(|_| "auth_failed")?);
+            let mut req = self
+                .0
+                .http
+                .post(url)
+                .timeout(Duration::from_secs(5))
+                .header("Authorization", format!("Nostr {auth}"))
+                .header("Content-Type", "application/json");
+            if let Some(tag) = &self.0.auth_tag_json {
+                req = req.header("x-auth-tag", tag);
+            }
+            let mut response = req
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| "relay_unreachable")?;
+            if !response.status().is_success() {
+                return Err("relay_http_error");
+            }
+            const LIMIT: usize = 4 * 1024 * 1024;
+            if response.content_length().is_some_and(|n| n > LIMIT as u64) {
+                return Err("response_overflow");
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| "relay_read_failed")? {
+                if bytes.len().saturating_add(chunk.len()) > LIMIT {
+                    return Err("response_overflow");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            serde_json::from_slice(&bytes).map_err(|_| "invalid_relay_response")
+        }
+    }
+
+    impl Transport for Bridge<'_> {
+        fn query(&self, filter: Value) -> Operation<'_> {
+            Box::pin(self.post("/query", json!([filter])))
+        }
+        fn submit(&self, event: &Event) -> Operation<'_> {
+            Box::pin(self.post("/events", json!(event)))
+        }
+    }
+
+    /// A private durable reservation. Never delete automatically: replay must not mint another ID.
+    pub struct Reservation {
+        file: std::fs::File,
+    }
+
+    impl Reservation {
+        /// Reserve a stable triggering batch before running the model. Existing reservations
+        /// fail closed after restarts; an operator can reconcile the persisted signed event.
+        pub fn acquire(directory: &Path, identity: &str) -> Result<Self, &'static str> {
+            #[cfg(unix)]
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+            #[cfg(not(unix))]
+            return Err("private_journal_unsupported");
+            #[cfg(unix)]
+            {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                match builder.create(directory) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err("journal_directory_failed"),
+                }
+                let meta =
+                    std::fs::symlink_metadata(directory).map_err(|_| "journal_metadata_failed")?;
+                if !meta.is_dir() || meta.mode() & 0o777 != 0o700 {
+                    return Err("unsafe_journal_directory");
+                }
+                let mut entries =
+                    std::fs::read_dir(directory).map_err(|_| "journal_read_failed")?;
+                if entries.by_ref().take(4097).count() >= 4096 {
+                    return Err("journal_capacity");
+                }
+                let name = hex::encode(Sha256::digest(identity.as_bytes()));
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(directory.join(name))
+                    .map_err(|_| "reserved_or_journal_failed")?;
+                let file_meta = file.metadata().map_err(|_| "journal_metadata_failed")?;
+                if file_meta.uid() != meta.uid() || file_meta.mode() & 0o777 != 0o600 {
+                    return Err("journal_owner_or_mode_mismatch");
+                }
+                std::fs::File::open(directory.parent().ok_or("journal_parent_missing")?)
+                    .and_then(|d| d.sync_all())
+                    .map_err(|_| "journal_sync_failed")?;
+                file.sync_all().map_err(|_| "journal_sync_failed")?;
+                std::fs::File::open(directory)
+                    .and_then(|d| d.sync_all())
+                    .map_err(|_| "journal_sync_failed")?;
+                Ok(Self { file })
+            }
+        }
+
+        fn persist(&mut self, event: &Event) -> Result<(), &'static str> {
+            let data = serde_json::to_vec(event).map_err(|_| "journal_encode_failed")?;
+            self.file
+                .write_all(&data)
+                .and_then(|_| self.file.sync_all())
+                .map_err(|_| "journal_sync_failed")
+        }
+    }
+
+    /// A bounded pre-turn snapshot prevents old flat-thread replies satisfying this turn.
+    pub struct Delivery {
+        destination: Destination,
+        author: PublicKey,
+        since: u64,
+        baseline: HashSet<EventId>,
+        reservation: Reservation,
+    }
+
+    impl Delivery {
+        fn filter(&self) -> Value {
+            let mut filter = json!({"kinds":[9],"authors":[self.author.to_hex()],"#h":[self.destination.channel.to_string()],"since":self.since,"limit":32});
+            if let Some(root) = self.destination.root {
+                filter["#e"] = json!([root.to_hex()]);
+            }
+            filter
+        }
+
+        fn events(&self, value: Value) -> Result<Vec<Event>, &'static str> {
+            let array = value.as_array().ok_or("invalid_query_shape")?;
+            if array.len() >= 32 {
+                return Err("query_truncated");
+            }
+            let mut events = Vec::new();
+            for value in array {
+                let e: Event =
+                    serde_json::from_value(value.clone()).map_err(|_| "invalid_query_event")?;
+                e.verify().map_err(|_| "invalid_query_signature")?;
+                if e.pubkey != self.author
+                    || e.kind != Kind::Custom(9)
+                    || e.created_at.as_u64() < self.since
+                {
+                    return Err("query_filter_mismatch");
+                }
+                if self.destination.matches(&e) {
+                    events.push(e);
+                }
+            }
+            Ok(events)
+        }
+
+        /// Snapshot accepted replies before the prompt. Query failure disables fallback.
+        pub async fn begin(
+            transport: &impl Transport,
+            destination: Destination,
+            keys: &Keys,
+            reservation: Reservation,
+        ) -> Result<Self, &'static str> {
+            if destination.root.is_some() != destination.parent.is_some() {
+                return Err("incomplete_destination");
+            }
+            let mut delivery = Self {
+                destination,
+                author: keys.public_key(),
+                since: Timestamp::now().as_u64().saturating_sub(1),
+                baseline: HashSet::new(),
+                reservation,
+            };
+            let events = delivery.events(transport.query(delivery.filter()).await?)?;
+            delivery.baseline.extend(events.into_iter().map(|e| e.id));
+            Ok(delivery)
+        }
+
+        /// Complete delivery after actual EndTurn. Never resubmit or rerun tools on ACK loss.
+        pub async fn finish(
+            mut self,
+            transport: &impl Transport,
+            keys: &Keys,
+            final_text: Result<String, &'static str>,
+        ) -> Outcome {
+            if keys.public_key() != self.author {
+                return Outcome::Failed("signer_changed");
+            }
+            let text = match final_text {
+                Ok(t) => t,
+                Err(e) => return Outcome::Failed(e),
+            };
+            let events = match transport
+                .query(self.filter())
+                .await
+                .and_then(|v| self.events(v))
+            {
+                Ok(e) => e,
+                Err(e) => return Outcome::Uncertain(e),
+            };
+            if let Some(e) = events.iter().find(|e| !self.baseline.contains(&e.id)) {
+                return Outcome::Existing(e.id);
+            }
+            if is_silence(&text) {
+                return Outcome::Silent;
+            }
+            let event = match self.destination.build(&text, keys) {
+                Ok(e) => e,
+                Err(e) => return Outcome::Failed(e),
+            };
+            if let Err(e) = self.reservation.persist(&event) {
+                return Outcome::Uncertain(e);
+            }
+            let ack = transport.submit(&event).await;
+            if let Ok(value) = &ack {
+                if value["event_id"].as_str() == Some(event.id.to_hex().as_str()) {
+                    match value["accepted"].as_bool() {
+                        Some(true) => return Outcome::Accepted(event.id),
+                        Some(false) => return Outcome::Failed("relay_rejected"),
+                        None => {}
+                    }
+                }
+            }
+            // A missing/unknown ACK is not success. Query the SAME ID, without a second POST.
+            let value = match transport
+                .query(json!({"ids":[event.id.to_hex()],"kinds":[9],"authors":[self.author.to_hex()],"#h":[self.destination.channel.to_string()],"limit":2}))
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Outcome::Uncertain(e),
+            };
+            let Some(array) = value.as_array() else {
+                return Outcome::Uncertain("invalid_readback");
+            };
+            if array.len() != 1 {
+                return Outcome::Uncertain("acceptance_unconfirmed");
+            }
+            match serde_json::from_value::<Event>(array[0].clone()) {
+                Ok(found) if found == event && found.verify().is_ok() => {
+                    Outcome::Accepted(event.id)
+                }
+                _ => Outcome::Uncertain("acceptance_unconfirmed"),
+            }
+        }
+    }
+
+    /// Explicit no-output markers are never sent as user-facing channel messages.
+    pub fn is_silence(text: &str) -> bool {
+        matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "" | "no_reply"
+                | "no_response"
+                | "silent"
+                | "[silent]"
+                | "[silence]"
+                | "(silence)"
+                | "heartbeat_ok"
+        )
     }
 }

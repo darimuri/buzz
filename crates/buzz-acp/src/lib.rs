@@ -14,6 +14,10 @@ mod usage;
 
 pub use usage::TurnUsage;
 
+pub use acp::FinalReplyCapture;
+/// Fail-closed reply delivery primitives used by the ACP harness.
+pub use pool::reply_delivery;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6178,7 +6182,9 @@ mod error_outcome_emission_tests {
         );
         assert_eq!(
             turn_error.payload["error"].as_str().unwrap(),
-            format!("Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."),
+            format!(
+                "Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."
+            ),
             "observer message must name the actual grace and must not claim preservation"
         );
         assert_eq!(
@@ -6280,7 +6286,9 @@ mod error_outcome_emission_tests {
         );
         assert_eq!(
             turn_error.payload["error"].as_str().unwrap(),
-            format!("Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."),
+            format!(
+                "Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."
+            ),
             "observer message must be fate-neutral even though the batch was dropped"
         );
         assert_eq!(
