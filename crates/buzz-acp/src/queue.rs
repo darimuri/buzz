@@ -4787,10 +4787,8 @@ pub(crate) fn fallback_destination(
             return Err("not_message");
         }
         let sender = e.pubkey.to_hex();
-        let human = owner == Some(e.pubkey)
-            || profiles
-                .and_then(|p| p.get(&sender))
-                .is_some_and(|p| !p.is_agent);
+        // Display profiles are self-authored UX metadata, never human authority.
+        let human = owner == Some(e.pubkey);
         if !human {
             return Err(
                 if profiles

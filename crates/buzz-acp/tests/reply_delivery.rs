@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 //! Offline delivery contracts: no relay, model, runtime or credential side effects.
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -58,8 +60,17 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+        let home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("buzz-reply-test-{}", Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
         Self {
-            dir: std::env::temp_dir().join(format!("buzz-reply-test-{}", Uuid::new_v4())),
+            dir: home.join("journal"),
             keys: Keys::generate(),
             dest: Destination {
                 channel: Uuid::new_v4(),
@@ -80,7 +91,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.dir).ok();
+        std::fs::remove_dir_all(self.dir.parent().unwrap()).ok();
     }
 }
 
@@ -389,4 +400,110 @@ fn journal_rejects_links_and_public_metadata() {
     symlink(&f.dir, &linked).unwrap();
     assert!(Reservation::acquire(&linked, "new-batch").is_err());
     std::fs::remove_file(linked).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ancestor_symlink_and_relative_noncanonical_state_are_rejected() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let home = f.dir.parent().unwrap();
+    let alias = home.with_extension("ancestor-link");
+    symlink(home, &alias).unwrap();
+    assert!(Reservation::acquire(&alias.join("journal"), "batch").is_err());
+    assert!(Reservation::acquire(std::path::Path::new("relative/journal"), "batch").is_err());
+    assert!(Reservation::acquire(&home.join(".").join("journal"), "batch").is_err());
+    assert!(!f.dir.exists());
+    std::fs::remove_file(alias).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn parent_replacement_cannot_redirect_publication_or_journal_write() {
+    use std::os::unix::fs::DirBuilderExt;
+    let f = Fixture::new();
+    let r = Relay::new(vec![Ok(json!([])), Ok(json!([]))], "accepted");
+    let d = Delivery::begin(&r, f.dest.clone(), &f.keys, f.reserve())
+        .await
+        .unwrap();
+    let home = f.dir.parent().unwrap();
+    let moved = home.with_extension("moved");
+    std::fs::rename(home, &moved).unwrap();
+    std::fs::DirBuilder::new().mode(0o700).create(home).unwrap();
+    let outcome = d.finish(&r, &f.keys, Ok("answer".into())).await;
+    assert!(matches!(outcome, Outcome::Uncertain(_)));
+    assert!(r.sent.lock().unwrap().is_empty());
+    assert!(!f.dir.exists());
+    let record = std::fs::read_dir(moved.join("journal"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(std::fs::metadata(record).unwrap().len(), 0);
+    std::fs::remove_dir_all(moved).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn hardlink_and_record_overflow_fail_closed_before_submit() {
+    for hardlink in [true, false] {
+        let f = Fixture::new();
+        let r = Relay::new(vec![Ok(json!([])), Ok(json!([]))], "accepted");
+        let d = Delivery::begin(&r, f.dest.clone(), &f.keys, f.reserve())
+            .await
+            .unwrap();
+        let record = std::fs::read_dir(&f.dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        if hardlink {
+            std::fs::hard_link(&record, f.dir.parent().unwrap().join("other-link")).unwrap();
+        } else {
+            std::fs::write(&record, vec![0u8; 256 * 1024 + 1]).unwrap();
+        }
+        assert!(Reservation::acquire(&f.dir, "stable-input-batch").is_err());
+        assert!(matches!(
+            d.finish(&r, &f.keys, Ok("answer".into())).await,
+            Outcome::Uncertain(_)
+        ));
+        assert!(r.sent.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn query_channel_and_conversation_conflicts_are_uncertain_not_absence() {
+    for conflict in ["channel", "thread"] {
+        let f = Fixture::new();
+        let mut destination = f.dest.clone();
+        let root = nostr::EventId::all_zeros();
+        destination.root = Some(root);
+        destination.parent = Some(root);
+        let event = buzz_sdk::builders::build_message(
+            if conflict == "channel" {
+                Uuid::new_v4()
+            } else {
+                destination.channel
+            },
+            "conflict",
+            None,
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .sign_with_keys(&f.keys)
+        .unwrap();
+        let r = Relay::new(vec![Ok(json!([])), Ok(json!([event]))], "accepted");
+        let d = Delivery::begin(&r, destination, &f.keys, f.reserve())
+            .await
+            .unwrap();
+        assert!(matches!(
+            d.finish(&r, &f.keys, Ok("answer".into())).await,
+            Outcome::Uncertain(_)
+        ));
+        assert!(r.sent.lock().unwrap().is_empty());
+    }
 }

@@ -1583,6 +1583,7 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
+        reply_state_home: std::env::var_os("HOME").map(std::path::PathBuf::from),
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -2892,9 +2893,11 @@ fn signal_in_flight_task(
 
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
-            tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
-            let _ = tx.send(mode);
-            return true;
+            if tx.send(mode).is_ok() {
+                tracing::info!(channel = %channel_id, "control signal sent to in-flight task");
+                return true;
+            }
+            tracing::warn!(channel = %channel_id, "control receiver already closed; signal not delivered");
         }
     }
     false

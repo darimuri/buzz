@@ -374,3 +374,37 @@ automatically removed. The journal is per agent HOME and is not a cross-host
 coordination service. Keep a single harness writer for each agent identity; do not
 share its identity/HOME across concurrent hosts. Journal failure disables delivery.
 No new credential, subscription, membership or runtime permissions are introduced.
+
+### Review corrections and state boundary
+
+Fallback human authority is owner-only. Self-authored display profiles, including
+an agent profile without an auth tag, do not authorize publication. A future
+verified human roster needs an explicit trust source; none is inferred here.
+Accepted same-agent replies are matched to the trusted conversation rather than
+the fallback's immediate parent. Nested CLI replies and DM parent variants
+suppress fallback; mismatched or conflicting query candidates fail closed.
+
+Control reception remains active after EndTurn through the duplicate query and
+the synchronous pre-submit commit boundary. A pre-submit cancellation prevents
+publication. Once submission begins, a cancellation cannot undo the possible
+relay effect: the harness awaits its outcome and reconciles the same signed ID.
+Late rotate/model controls still update future session state.
+
+Journal support currently requires Linux procfs. The startup-captured HOME must
+be absolute, lexically canonical, symlink-free, owned by the current agent and
+0700. Every ancestor is opened with no-follow directory flags, must be owned by
+root or the current agent, and must reject group/other writes unless protected
+by sticky-directory semantics. Held descriptors anchor creation and persistence
+through /proc/self/fd; replacement path components cannot redirect journal I/O.
+An inode rewalk detects parent replacement. Records must remain regular files
+owned by the current agent, 0600, single-linked and at most 256 KiB, with an empty
+record before the single signed-event write. Relative HOME, unsafe ancestors,
+symlinks, hardlinks, owner/mode changes, path replacement and size violations
+fail closed. Unsupported platforms suppress fallback by refusing reservation.
+
+Replay detection precedes capacity refusal. Every reservation failure, including
+a full journal or indeterminate metadata, stops an eligible human turn before
+initial and main prompts/tools. No journal error permits model/tool replay.
+Production lifecycle tests use a local fake ACP process and authenticated Bridge
+HTTP boundary, with paused duplicate queries and paused accepted submissions;
+they require no live relay, model, credentials, container or production state.
