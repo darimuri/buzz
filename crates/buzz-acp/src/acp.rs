@@ -39,6 +39,89 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// Bounded final assistant segment for one ACP prompt. Tool boundaries discard narration.
+#[derive(Debug, Default)]
+pub struct FinalReplyCapture {
+    session: String,
+    text: String,
+    bytes: usize,
+    invalid: bool,
+    pending: std::collections::HashSet<String>,
+}
+
+impl FinalReplyCapture {
+    /// Begin a new prompt; data from previous sessions cannot be reused.
+    pub fn begin(&mut self, session: &str) {
+        *self = Self {
+            session: session.to_owned(),
+            ..Self::default()
+        };
+    }
+
+    /// Invalidate a prompt whose destination changed through native steering.
+    pub fn invalidate(&mut self) {
+        self.invalid = true;
+        self.text.clear();
+    }
+
+    /// Observe only typed updates for this prompt's session.
+    pub fn update(&mut self, msg: &serde_json::Value) {
+        if msg["params"]["sessionId"].as_str() != Some(self.session.as_str()) {
+            return;
+        }
+        let u = &msg["params"]["update"];
+        match u["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") if u["content"]["type"] == "text" => {
+                if let Some(text) = u["content"]["text"].as_str() {
+                    self.bytes = self.bytes.saturating_add(text.len());
+                    if self.bytes > 64 * 1024 {
+                        self.invalidate();
+                    }
+                    if !self.invalid && self.pending.is_empty() {
+                        self.text.push_str(text);
+                    }
+                }
+            }
+            Some("tool_call" | "tool_call_update") => {
+                self.text.clear();
+                if let Some(id) = u["toolCallId"].as_str() {
+                    if id.len() > 256 {
+                        self.invalidate();
+                        return;
+                    }
+                    match u["status"].as_str() {
+                        Some("completed" | "failed") => {
+                            self.pending.remove(id);
+                        }
+                        _ => {
+                            if self.pending.len() >= 64 {
+                                self.invalidate();
+                            } else {
+                                self.pending.insert(id.to_owned());
+                            }
+                        }
+                    }
+                } else {
+                    self.invalidate();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Consume the segment only for a real successful EndTurn.
+    pub fn finish(&mut self, end_turn: bool) -> Result<String, &'static str> {
+        let old = std::mem::take(self);
+        if !end_turn {
+            return Err("non_end_turn");
+        }
+        if old.invalid || !old.pending.is_empty() {
+            return Err("capture_uncertain_or_overflow");
+        }
+        Ok(old.text)
+    }
+}
+
 /// Stop reason returned by `session/prompt` when the agent finishes a turn.
 ///
 /// Maps to the `stopReason` field in the `SessionPromptResponse`.
@@ -166,6 +249,7 @@ pub struct AcpClient {
     /// Inherited by `cancel_with_cleanup` so the drain loop shares the same budget
     /// rather than starting a fresh timer (prevents double-jeopardy).
     current_hard_deadline: Option<tokio::time::Instant>,
+    final_reply: FinalReplyCapture,
     /// Optional local observer feed used by the desktop app.
     observer: Option<ObserverHandle>,
     /// Pool slot index for this agent process.
@@ -543,6 +627,7 @@ impl AcpClient {
             permission_responded: false,
             last_prompt_id: None,
             current_hard_deadline: None,
+            final_reply: FinalReplyCapture::default(),
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
@@ -551,6 +636,10 @@ impl AcpClient {
             steer_rx: None,
             goose_usage: UsageTracker::default(),
         })
+    }
+
+    pub(crate) fn take_final_reply(&mut self, end_turn: bool) -> Result<String, &'static str> {
+        self.final_reply.finish(end_turn)
     }
 
     /// Attach a local observer feed to this ACP client.
@@ -759,6 +848,7 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.final_reply.begin(session_id);
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -1362,6 +1452,7 @@ impl AcpClient {
                         None => None,
                     }
                 }, if pending_steer.is_none() => {
+                    self.final_reply.invalidate();
                     // Selected: choose the steer transport and build its
                     // params at write time using the lexical `session_id`
                     // and the freshest `active_run_id`.
@@ -1705,6 +1796,7 @@ impl AcpClient {
     /// leave it `None` and are steered via `_session/steering` instead, which
     /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
+        self.final_reply.update(msg);
         let update = &msg["params"]["update"];
         let update_type = update
             .get("sessionUpdate")
@@ -4491,5 +4583,38 @@ mod tests {
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
         );
+    }
+}
+
+#[cfg(test)]
+mod reply_capture_wire_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn actual_end_turn_uses_only_final_post_tool_wire_text() {
+        let script = r#"
+IFS= read -r request
+printf '%s\n' \
+'{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"narration"}}}}' \
+'{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"t","status":"in_progress"}}}' \
+'{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"t","status":"completed","content":[{"type":"text","text":"private tool output"}]}}}' \
+'{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"private thought"}}}}' \
+'{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"exact final"}}}}' \
+'{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut client = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .unwrap();
+        let stop = client
+            .session_prompt_with_idle_timeout(
+                "s",
+                "fixture",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop, StopReason::EndTurn);
+        assert_eq!(client.take_final_reply(true).unwrap(), "exact final");
     }
 }

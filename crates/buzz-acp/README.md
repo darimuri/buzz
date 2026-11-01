@@ -338,3 +338,73 @@ See the [root TESTING.md](../../TESTING.md) for the full integration testing gui
 ## License
 
 Apache-2.0
+
+## Final reply delivery
+
+For a verified human message, the harness can deliver the final ACP assistant
+text when the agent omitted a Buzz CLI reply. Only an actual `end_turn` qualifies.
+Thoughts, tool output and narration preceding the last tool boundary are excluded;
+64 KiB cumulative assistant text, incomplete tools, steering, refusal, cancellation
+and unknown routing fail closed. Empty output and explicit `NO_REPLY`,
+`NO_RESPONSE`, `[silent]`, `(silence)` and `HEARTBEAT_OK` markers are suppressed.
+Heartbeat, agent-only, broadcast and silent work never receive a fallback.
+
+Routing comes from the accepted batch and channel metadata. Human channel threads
+stay flat at their original root; top-level human messages open a thread. Top-level
+DM replies stay top-level, and DM thread replies retain their original root and
+triggering parent. Mixed destinations, cancelled batches, ambiguous legacy tags
+and unknown sender/channel metadata disable fallback.
+
+Before the model runs, a bounded authenticated relay query records existing
+same-agent replies. After EndTurn, another query checks for an accepted new reply
+at the same destination, independently of WebSocket self echoes. An existing reply
+suppresses fallback. Otherwise the harness signs one event, persists it, and submits
+it once. Only a matching positive relay receipt or authenticated readback of that
+identical signed event counts as delivery. A lost ACK never causes another model
+run, tool call, signature or event POST. Query errors, truncation, rejection and
+unconfirmed readback produce a separate `reply_delivery` failed/uncertain outcome;
+model completion alone is not delivery success.
+
+Private durable reservations live in `$HOME/.buzz-acp-reply-delivery-v1` (0700
+directory, 0600 files, at most 4096 entries). A reservation is created before the
+prompt and persists across process failure. Replaying a reserved input stops before
+running the model or tools. Operators must reconcile reserved inputs against the
+relay and the stored signed event before any manual retry; reservations are never
+automatically removed. The journal is per agent HOME and is not a cross-host
+coordination service. Keep a single harness writer for each agent identity; do not
+share its identity/HOME across concurrent hosts. Journal failure disables delivery.
+No new credential, subscription, membership or runtime permissions are introduced.
+
+### Review corrections and state boundary
+
+Fallback human authority is owner-only. Self-authored display profiles, including
+an agent profile without an auth tag, do not authorize publication. A future
+verified human roster needs an explicit trust source; none is inferred here.
+Accepted same-agent replies are matched to the trusted conversation rather than
+the fallback's immediate parent. Nested CLI replies and DM parent variants
+suppress fallback; mismatched or conflicting query candidates fail closed.
+
+Control reception remains active after EndTurn through the duplicate query and
+the synchronous pre-submit commit boundary. A pre-submit cancellation prevents
+publication. Once submission begins, a cancellation cannot undo the possible
+relay effect: the harness awaits its outcome and reconciles the same signed ID.
+Late rotate/model controls still update future session state.
+
+Journal support currently requires Linux procfs. The startup-captured HOME must
+be absolute, lexically canonical, symlink-free, owned by the current agent and
+0700. Every ancestor is opened with no-follow directory flags, must be owned by
+root or the current agent, and must reject group/other writes unless protected
+by sticky-directory semantics. Held descriptors anchor creation and persistence
+through /proc/self/fd; replacement path components cannot redirect journal I/O.
+An inode rewalk detects parent replacement. Records must remain regular files
+owned by the current agent, 0600, single-linked and at most 256 KiB, with an empty
+record before the single signed-event write. Relative HOME, unsafe ancestors,
+symlinks, hardlinks, owner/mode changes, path replacement and size violations
+fail closed. Unsupported platforms suppress fallback by refusing reservation.
+
+Replay detection precedes capacity refusal. Every reservation failure, including
+a full journal or indeterminate metadata, stops an eligible human turn before
+initial and main prompts/tools. No journal error permits model/tool replay.
+Production lifecycle tests use a local fake ACP process and authenticated Bridge
+HTTP boundary, with paused duplicate queries and paused accepted submissions;
+they require no live relay, model, credentials, container or production state.

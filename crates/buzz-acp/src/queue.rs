@@ -4762,3 +4762,252 @@ mod tests {
         );
     }
 }
+
+/// Resolve a fallback exclusively from accepted, signature-verified batch metadata.
+/// Unknown identities, mixed destinations and non-human work are never inferred safe.
+pub(crate) fn fallback_destination(
+    batch: &FlushBatch,
+    channel: Option<&PromptChannelInfo>,
+    profiles: Option<&PromptProfileLookup>,
+    owner: Option<nostr::PublicKey>,
+) -> Result<crate::pool::reply_delivery::Destination, &'static str> {
+    use crate::pool::reply_delivery::Destination;
+    let kind = channel.ok_or("unknown_channel")?.channel_type.as_str();
+    if !matches!(kind, "dm" | "stream" | "private") {
+        return Err("unknown_channel_type");
+    }
+    if batch.events.is_empty() || !batch.cancelled_events.is_empty() {
+        return Err("incomplete_or_cancelled_batch");
+    }
+    let mut result = None;
+    for be in &batch.events {
+        let e = &be.event;
+        e.verify().map_err(|_| "invalid_trigger")?;
+        if e.kind != nostr::Kind::Custom(9) {
+            return Err("not_message");
+        }
+        let sender = e.pubkey.to_hex();
+        // Display profiles are self-authored UX metadata, never human authority.
+        let human = owner == Some(e.pubkey);
+        if !human {
+            return Err(
+                if profiles
+                    .and_then(|p| p.get(&sender))
+                    .is_some_and(|p| p.is_agent)
+                {
+                    "agent_only"
+                } else {
+                    "unknown_sender"
+                },
+            );
+        }
+        let mut h = Vec::new();
+        let mut root = None;
+        let mut parent = None;
+        for tag in e.tags.iter() {
+            let t = tag.as_slice();
+            match t[0].as_str() {
+                "h" => h.push(t.get(1).map(String::as_str)),
+                "broadcast" | "silent" => return Err("silent_or_broadcast"),
+                "e" => {
+                    let id = t
+                        .get(1)
+                        .and_then(|s| nostr::EventId::from_hex(s).ok())
+                        .ok_or("invalid_thread")?;
+                    let slot = match t.get(3).map(String::as_str) {
+                        Some("root") => &mut root,
+                        Some("reply") => &mut parent,
+                        _ => return Err("ambiguous_thread"),
+                    };
+                    if slot.replace(id).is_some() {
+                        return Err("duplicate_thread_tag");
+                    }
+                }
+                _ => {}
+            }
+        }
+        let channel_id = batch.channel_id.to_string();
+        if h != vec![Some(channel_id.as_str())] {
+            return Err("channel_mismatch");
+        }
+        let root = root.or(parent);
+        let destination = if kind == "dm" {
+            Destination {
+                channel: batch.channel_id,
+                root,
+                parent: root.map(|_| e.id),
+            }
+        } else {
+            let root = root.unwrap_or(e.id);
+            Destination {
+                channel: batch.channel_id,
+                root: Some(root),
+                parent: Some(root),
+            }
+        };
+        if result.as_ref().is_some_and(|r| r != &destination) {
+            return Err("mixed_batch_destinations");
+        }
+        result = Some(destination);
+    }
+    result.ok_or("empty_batch")
+}
+
+#[cfg(test)]
+mod fallback_routing_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn event(keys: &Keys, channel: Uuid, extra: &[Vec<&str>]) -> Event {
+        let mut tags = vec![Tag::parse(["h", &channel.to_string()]).unwrap()];
+        tags.extend(extra.iter().map(|t| Tag::parse(t.clone()).unwrap()));
+        EventBuilder::new(Kind::Custom(9), "trusted trigger")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+    fn batch(channel: Uuid, events: Vec<Event>) -> FlushBatch {
+        FlushBatch {
+            channel_id: channel,
+            events: events
+                .into_iter()
+                .map(|event| BatchEvent {
+                    event,
+                    prompt_tag: "mention".into(),
+                    received_at: Instant::now(),
+                })
+                .collect(),
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+    fn info(kind: &str) -> PromptChannelInfo {
+        PromptChannelInfo {
+            name: "fixture".into(),
+            channel_type: kind.into(),
+        }
+    }
+
+    #[test]
+    fn human_top_level_and_flat_thread_are_trusted() {
+        let human = Keys::generate();
+        let ch = Uuid::new_v4();
+        let e = event(&human, ch, &[]);
+        let b = batch(ch, vec![e.clone()]);
+        let d = fallback_destination(&b, Some(&info("stream")), None, Some(human.public_key()))
+            .unwrap();
+        assert_eq!(d.root, Some(e.id));
+        assert_eq!(d.parent, Some(e.id));
+        let root = nostr::EventId::all_zeros().to_hex();
+        let nested = event(
+            &human,
+            ch,
+            &[
+                vec!["e", &root, "", "root"],
+                vec!["e", &e.id.to_hex(), "", "reply"],
+            ],
+        );
+        let d = fallback_destination(
+            &batch(ch, vec![nested]),
+            Some(&info("private")),
+            None,
+            Some(human.public_key()),
+        )
+        .unwrap();
+        assert_eq!(d.root.unwrap().to_hex(), root);
+        assert_eq!(d.root, d.parent);
+    }
+
+    #[test]
+    fn dm_top_level_stays_top_level_and_thread_keeps_parent() {
+        let human = Keys::generate();
+        let ch = Uuid::new_v4();
+        let d = fallback_destination(
+            &batch(ch, vec![event(&human, ch, &[])]),
+            Some(&info("dm")),
+            None,
+            Some(human.public_key()),
+        )
+        .unwrap();
+        assert_eq!((d.root, d.parent), (None, None));
+        let root = nostr::EventId::all_zeros().to_hex();
+        let e = event(&human, ch, &[vec!["e", &root, "", "reply"]]);
+        let d = fallback_destination(
+            &batch(ch, vec![e.clone()]),
+            Some(&info("dm")),
+            None,
+            Some(human.public_key()),
+        )
+        .unwrap();
+        assert_eq!(d.root.unwrap().to_hex(), root);
+        assert_eq!(d.parent, Some(e.id));
+    }
+
+    #[test]
+    fn mixed_roots_ambiguous_tags_unknown_and_channel_mismatch_fail_closed() {
+        let human = Keys::generate();
+        let ch = Uuid::new_v4();
+        let stream = info("stream");
+        let e = event(&human, ch, &[]);
+        let root = nostr::EventId::all_zeros().to_hex();
+        for b in [
+            batch(
+                ch,
+                vec![
+                    e.clone(),
+                    event(&human, ch, &[vec!["e", &root, "", "reply"]]),
+                ],
+            ),
+            batch(ch, vec![event(&human, ch, &[vec!["e", &root]])]),
+            batch(ch, vec![event(&human, Uuid::new_v4(), &[])]),
+            batch(
+                ch,
+                vec![event(
+                    &human,
+                    ch,
+                    &[vec!["e", &root, "", "root"], vec!["e", &root, "", "root"]],
+                )],
+            ),
+        ] {
+            assert!(
+                fallback_destination(&b, Some(&stream), None, Some(human.public_key())).is_err()
+            );
+        }
+        let b = batch(ch, vec![e]);
+        assert!(fallback_destination(&b, None, None, Some(human.public_key())).is_err());
+        assert!(fallback_destination(&b, Some(&stream), None, None).is_err());
+        assert!(
+            fallback_destination(&b, Some(&info("unknown")), None, Some(human.public_key()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_only_broadcast_silent_and_cancelled_work_are_excluded() {
+        let human = Keys::generate();
+        let ch = Uuid::new_v4();
+        let stream = info("stream");
+        for extra in [vec![vec!["broadcast", "1"]], vec![vec!["silent", "1"]]] {
+            assert!(fallback_destination(
+                &batch(ch, vec![event(&human, ch, &extra)]),
+                Some(&stream),
+                None,
+                Some(human.public_key())
+            )
+            .is_err());
+        }
+        let e = event(&human, ch, &[]);
+        let mut b = batch(ch, vec![e]);
+        let mut profiles = PromptProfileLookup::new();
+        profiles.insert(
+            human.public_key().to_hex(),
+            PromptProfile {
+                is_agent: true,
+                ..Default::default()
+            },
+        );
+        assert!(fallback_destination(&b, Some(&stream), Some(&profiles), None).is_err());
+        b.cancelled_events = b.events.clone();
+        assert!(fallback_destination(&b, Some(&stream), None, Some(human.public_key())).is_err());
+    }
+}

@@ -14,6 +14,10 @@ mod usage;
 
 pub use usage::TurnUsage;
 
+pub use acp::FinalReplyCapture;
+/// Fail-closed reply delivery primitives used by the ACP harness.
+pub use pool::reply_delivery;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1579,6 +1583,7 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
+        reply_state_home: std::env::var_os("HOME").map(std::path::PathBuf::from),
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -2888,9 +2893,11 @@ fn signal_in_flight_task(
 
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
-            tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
-            let _ = tx.send(mode);
-            return true;
+            if tx.send(mode).is_ok() {
+                tracing::info!(channel = %channel_id, "control signal sent to in-flight task");
+                return true;
+            }
+            tracing::warn!(channel = %channel_id, "control receiver already closed; signal not delivered");
         }
     }
     false
@@ -6178,7 +6185,9 @@ mod error_outcome_emission_tests {
         );
         assert_eq!(
             turn_error.payload["error"].as_str().unwrap(),
-            format!("Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."),
+            format!(
+                "Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."
+            ),
             "observer message must name the actual grace and must not claim preservation"
         );
         assert_eq!(
@@ -6280,7 +6289,9 @@ mod error_outcome_emission_tests {
         );
         assert_eq!(
             turn_error.payload["error"].as_str().unwrap(),
-            format!("Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."),
+            format!(
+                "Agent did not stop within {grace:?} after cancellation; the agent process is being replaced."
+            ),
             "observer message must be fate-neutral even though the batch was dropped"
         );
         assert_eq!(

@@ -522,6 +522,8 @@ pub struct PromptContext {
     /// (`include_str!`) is inherently `'static`.
     pub base_prompt: Option<&'static str>,
     pub cwd: String,
+    /// Startup-captured private agent HOME; validated before journal use.
+    pub reply_state_home: Option<std::path::PathBuf>,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
     /// Shared channel metadata for startup-known and dynamically joined channels.
@@ -1343,7 +1345,7 @@ pub async fn run_prompt_task(
     prompt_text: Option<String>,
     ctx: Arc<PromptContext>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
-    control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
+    mut control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     turn_id: String,
 ) {
     // Is this a channel prompt or a heartbeat?
@@ -1355,6 +1357,8 @@ pub async fn run_prompt_task(
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
+    let mut delivery = Err("not_human_turn");
+    let mut replay_blocked = false;
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
@@ -1381,12 +1385,86 @@ pub async fn run_prompt_task(
     // metadata now, before the agent is moved into PromptResult. It must be
     // declared before `liveness_guard`: Rust drops locals in reverse order, so
     // liveness is aborted before completion makes the turn terminal.
-    let _turn_guard = TurnCompletionGuard::new(
+    let turn_guard = TurnCompletionGuard::new(
         agent.acp.observer_handle(),
         agent.acp.observer_agent_index(),
         observer_channel_id,
         turn_id.clone(),
     );
+
+    // Reserve and snapshot before ANY initial/session prompt can run model/tools.
+    // A previously persisted batch must not be replayed even after process failure.
+    let mut stable_trigger_ids = triggering_event_ids.clone();
+    stable_trigger_ids.sort();
+    if let Some(b) = &batch {
+        let channel_info = ctx.channel_info.resolve(b.channel_id).await;
+        let profile_lookup = fetch_prompt_profile_lookup(b, None, &ctx.rest_client).await;
+        delivery = match crate::queue::fallback_destination(
+            b,
+            channel_info.as_ref(),
+            profile_lookup.as_ref(),
+            ctx.agent_owner_pubkey,
+        ) {
+            Ok(destination) => {
+                let identity = format!(
+                    "{}:{}:{:?}",
+                    ctx.agent_keys.public_key(),
+                    b.channel_id,
+                    stable_trigger_ids
+                );
+                let reservation = ctx
+                    .reply_state_home
+                    .as_ref()
+                    .ok_or("home_unavailable")
+                    .and_then(|home| {
+                        reply_delivery::Reservation::acquire(
+                            &home.join(".buzz-acp-reply-delivery-v1"),
+                            &identity,
+                        )
+                    });
+                match reservation {
+                    Ok(reservation) => {
+                        reply_delivery::Delivery::begin(
+                            &reply_delivery::Bridge(&ctx.rest_client),
+                            destination,
+                            &ctx.agent_keys,
+                            reservation,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        replay_blocked = true;
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        };
+    }
+    if replay_blocked {
+        let reason = delivery
+            .as_ref()
+            .err()
+            .copied()
+            .unwrap_or("journal_indeterminate");
+        agent.acp.observe(
+            "reply_delivery",
+            serde_json::json!({"status":"uncertain", "reason":reason}),
+        );
+        turn_guard
+            .delivery_recorded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(target: "pool::delivery", reason, "journal preflight rejected; model/tools not executed");
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Ok(StopReason::Cancelled),
+            None,
+        );
+        return;
+    }
 
     // Start liveness with `turn_started`, not the final session/prompt call:
     // session creation, context fetches, and an initial message can themselves
@@ -1917,7 +1995,7 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
-    let prompt_result = match control_rx {
+    let prompt_result = match control_rx.as_mut() {
         None => {
             // Heartbeat / non-cancellable path.
             tokio::select! {
@@ -2083,6 +2161,49 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+            let final_text = agent
+                .acp
+                .take_final_reply(stop_reason == StopReason::EndTurn);
+            let mut delivery_control = None;
+            let delivery_outcome = match delivery {
+                Ok(delivery) => {
+                    delivery
+                        .finish_with_control(
+                            &reply_delivery::Bridge(&ctx.rest_client),
+                            &ctx.agent_keys,
+                            final_text,
+                            &mut control_rx,
+                            &mut delivery_control,
+                        )
+                        .await
+                }
+                Err(
+                    reason @ ("not_human_turn"
+                    | "agent_only"
+                    | "silent_or_broadcast"
+                    | "not_message"),
+                ) => reply_delivery::Outcome::Suppressed(reason),
+                Err(reason) => reply_delivery::Outcome::Uncertain(reason),
+            };
+            // Preserve late rotate/model/interrupt state as well as cancellation.
+            // A post-submit control affects future session state, never reverses a receipt.
+            let late_control =
+                delivery_control.or_else(|| control_rx.as_mut().and_then(|rx| rx.try_recv().ok()));
+            if let Some(signal) = late_control {
+                if let ControlSignal::SwitchModel(ref model) = signal {
+                    agent.desired_model = Some(model.clone());
+                    agent.model_overridden = true;
+                }
+                apply_completed_before_control_signal(&mut agent.state, &source, &signal);
+            }
+            agent.acp.observe(
+                "reply_delivery",
+                serde_json::json!({"outcome":format!("{delivery_outcome:?}")}),
+            );
+            turn_guard
+                .delivery_recorded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(target: "pool::delivery", ?delivery_outcome, "terminal reply delivery outcome (independent of model outcome)");
 
             let should_rotate = matches!(
                 stop_reason,
@@ -3546,6 +3667,7 @@ impl Drop for LivenessGuard {
 // the agent is moved into `PromptResult`.
 
 struct TurnCompletionGuard {
+    delivery_recorded: std::sync::atomic::AtomicBool,
     observer: Option<observer::ObserverHandle>,
     agent_index: Option<usize>,
     channel_id: Option<uuid::Uuid>,
@@ -3560,6 +3682,7 @@ impl TurnCompletionGuard {
         turn_id: String,
     ) -> Self {
         Self {
+            delivery_recorded: std::sync::atomic::AtomicBool::new(false),
             observer,
             agent_index,
             channel_id,
@@ -3572,12 +3695,24 @@ impl Drop for TurnCompletionGuard {
     fn drop(&mut self) {
         if let Some(observer) = self.observer.take() {
             let context = observer::context_for(self.channel_id, None, Some(self.turn_id.clone()));
+            if !self
+                .delivery_recorded
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                observer.emit("reply_delivery", self.agent_index, &context, serde_json::json!({"status":"failed_or_uncertain", "reason":"no_terminal_delivery_receipt"}));
+            }
             observer.emit(
                 "turn_completed",
                 self.agent_index,
                 &context,
-                serde_json::json!({}),
+                serde_json::json!({"deliveryReceiptRecorded":self.delivery_recorded.load(std::sync::atomic::Ordering::Relaxed)}),
             );
+        }
+        if !self
+            .delivery_recorded
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(target: "pool::delivery", turn_id = %self.turn_id, "reply delivery failed/uncertain: no terminal receipt");
         }
     }
 }
@@ -6390,6 +6525,7 @@ mod tests {
             heartbeat_prompt: None,
             base_prompt: None,
             cwd: ".".to_string(),
+            reply_state_home: None,
             rest_client: RestClient {
                 http: reqwest::Client::new(),
                 base_url: "http://127.0.0.1:0".to_string(),
@@ -6859,6 +6995,1220 @@ mod tests {
             2,
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
+        server.abort();
+    }
+}
+
+/// Bounded, positively verified delivery of a final ACP reply.
+pub mod reply_delivery {
+    use std::collections::HashSet;
+    use std::future::Future;
+    #[cfg(target_os = "linux")]
+    use std::io::Write;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use base64::Engine;
+    use nostr::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    /// A destination resolved from trusted input, never assistant prose.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Destination {
+        /// Accepted channel UUID (including top-level DMs).
+        pub channel: Uuid,
+        /// Original thread root, or no root for a top-level DM.
+        pub root: Option<EventId>,
+        /// Human thread anchor or DM parent.
+        pub parent: Option<EventId>,
+    }
+
+    impl Destination {
+        fn conversation_matches(&self, e: &Event) -> bool {
+            let channels: Vec<_> = e.tags.iter().filter(|t| t.as_slice()[0] == "h").collect();
+            if channels.len() != 1
+                || channels[0].as_slice().get(1) != Some(&self.channel.to_string())
+            {
+                return false;
+            }
+            let mut root = None;
+            let mut parent = None;
+            for t in e.tags.iter() {
+                let t = t.as_slice();
+                if t[0] == "broadcast" || t[0] == "silent" {
+                    return false;
+                }
+                if t[0] == "e" {
+                    let Some(id) = t.get(1).and_then(|x| EventId::from_hex(x).ok()) else {
+                        return false;
+                    };
+                    let slot = match t.get(3).map(String::as_str) {
+                        Some("root") => &mut root,
+                        Some("reply") => &mut parent,
+                        _ => return false,
+                    };
+                    if slot.replace(id).is_some() {
+                        return false;
+                    }
+                }
+            }
+            // Evidence follows the trusted conversation, regardless of immediate parent.
+            // For top-level DMs the entire same-channel query is conservative evidence.
+            self.root.is_none() || root.or(parent) == self.root
+        }
+
+        fn build(&self, text: &str, keys: &Keys) -> Result<Event, &'static str> {
+            let thread = self
+                .root
+                .zip(self.parent)
+                .map(|(root_event_id, parent_event_id)| buzz_sdk::ThreadRef {
+                    root_event_id,
+                    parent_event_id,
+                });
+            buzz_sdk::builders::build_message(self.channel, text, thread.as_ref(), &[], false, &[])
+                .map_err(|_| "event_build_failed")?
+                .sign_with_keys(keys)
+                .map_err(|_| "event_sign_failed")
+        }
+    }
+
+    /// Observable delivery result, separate from the model's stop reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Outcome {
+        /// Intentional background or agent-only work is outside fallback delivery.
+        Suppressed(&'static str),
+        /// A real accepted reply from this turn was found by authenticated query.
+        Existing(EventId),
+        /// The exact signed fallback was positively accepted or read back.
+        Accepted(EventId),
+        /// Explicit empty/silence final, with no publication.
+        Silent,
+        /// A known rejection or unsafe capture; nothing further may be sent.
+        Failed(&'static str),
+        /// An ambiguous relay or process outcome requires reconciliation.
+        Uncertain(&'static str),
+    }
+
+    /// Boxed transport operation; test transports need no live relay or keys.
+    pub type Operation<'a> = Pin<Box<dyn Future<Output = Result<Value, &'static str>> + Send + 'a>>;
+
+    /// Authenticated, bounded relay interface. Query results must be complete up to the cap.
+    pub trait Transport {
+        /// Read signed events matching a fixed filter.
+        fn query(&self, filter: Value) -> Operation<'_>;
+        /// Submit exactly this immutable signed event once.
+        fn submit(&self, event: &Event) -> Operation<'_>;
+    }
+
+    pub(crate) struct Bridge<'a>(pub &'a crate::relay::RestClient);
+
+    impl Bridge<'_> {
+        async fn post(&self, path: &str, value: Value) -> Result<Value, &'static str> {
+            let body = serde_json::to_vec(&value).map_err(|_| "encode_failed")?;
+            let url = format!("{}{}", self.0.base_url, path);
+            let tags = vec![
+                Tag::parse(["u", url.as_str()]),
+                Tag::parse(["method", "POST"]),
+                Tag::parse(["nonce", &Uuid::new_v4().to_string()]),
+                Tag::parse(["payload", &hex::encode(Sha256::digest(&body))]),
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "auth_failed")?;
+            let auth = EventBuilder::new(Kind::HttpAuth, "")
+                .tags(tags)
+                .sign_with_keys(&self.0.keys)
+                .map_err(|_| "auth_failed")?;
+            let auth = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&auth).map_err(|_| "auth_failed")?);
+            let mut req = self
+                .0
+                .http
+                .post(url)
+                .timeout(Duration::from_secs(5))
+                .header("Authorization", format!("Nostr {auth}"))
+                .header("Content-Type", "application/json");
+            if let Some(tag) = &self.0.auth_tag_json {
+                req = req.header("x-auth-tag", tag);
+            }
+            let mut response = req
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| "relay_unreachable")?;
+            if !response.status().is_success() {
+                return Err("relay_http_error");
+            }
+            const LIMIT: usize = 4 * 1024 * 1024;
+            if response.content_length().is_some_and(|n| n > LIMIT as u64) {
+                return Err("response_overflow");
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| "relay_read_failed")? {
+                if bytes.len().saturating_add(chunk.len()) > LIMIT {
+                    return Err("response_overflow");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            serde_json::from_slice(&bytes).map_err(|_| "invalid_relay_response")
+        }
+    }
+
+    impl Transport for Bridge<'_> {
+        fn query(&self, filter: Value) -> Operation<'_> {
+            Box::pin(self.post("/query", json!([filter])))
+        }
+        fn submit(&self, event: &Event) -> Operation<'_> {
+            Box::pin(self.post("/events", json!(event)))
+        }
+    }
+
+    // Safe std APIs plus Linux O_NOFOLLOW/O_DIRECTORY and /proc/self/fd keep every
+    // operation relative to held directory descriptors. No pathname reopen can
+    // redirect a write into a replacement/symlinked parent. Other OSes fail closed.
+    #[cfg(target_os = "linux")]
+    mod journal {
+        use super::*;
+        use std::fs::{File, Metadata, OpenOptions};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+        use std::path::{Component, PathBuf};
+
+        const MAX_RECORD: u64 = 256 * 1024;
+
+        fn uid() -> Result<u32, &'static str> {
+            // Kernel procfs process directory ownership reflects the current agent.
+            std::fs::metadata("/proc/self")
+                .map(|m| m.uid())
+                .map_err(|_| "agent_uid_unavailable")
+        }
+
+        fn directory(path: &Path) -> Result<File, &'static str> {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY | nix::libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|_| "unsafe_journal_ancestor")
+        }
+
+        fn relative(dir: &File, name: &std::ffi::OsStr) -> PathBuf {
+            PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name)
+        }
+
+        fn trusted_directory(meta: &Metadata, agent: u32) -> bool {
+            // Sticky shared temporary roots protect individually-owned private children.
+            meta.is_dir()
+                && (meta.uid() == 0 || meta.uid() == agent)
+                && (meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0)
+        }
+
+        fn private_directory(meta: &Metadata, agent: u32) -> bool {
+            meta.is_dir() && meta.uid() == agent && meta.mode() & 0o7777 == 0o700
+        }
+
+        fn record(meta: &Metadata, agent: u32) -> bool {
+            meta.is_file()
+                && meta.uid() == agent
+                && meta.mode() & 0o7777 == 0o600
+                && meta.nlink() == 1
+                && meta.len() <= MAX_RECORD
+        }
+
+        struct Anchor {
+            path: PathBuf,
+            dirs: Vec<File>,
+            agent: u32,
+        }
+
+        impl Anchor {
+            fn open(home: &Path) -> Result<Self, &'static str> {
+                if !home.is_absolute()
+                    || home
+                        .components()
+                        .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+                {
+                    return Err("noncanonical_agent_home");
+                }
+                let lexical: PathBuf = home.components().collect();
+                if lexical.as_os_str() != home.as_os_str()
+                    || std::fs::canonicalize(home).map_err(|_| "invalid_agent_home")? != home
+                {
+                    return Err("noncanonical_agent_home");
+                }
+                let agent = uid()?;
+                let mut dirs = vec![directory(Path::new("/"))?];
+                for part in home.components() {
+                    if let Component::Normal(name) = part {
+                        let parent = dirs.last().ok_or("journal_anchor_missing")?;
+                        let next = directory(&relative(parent, name))?;
+                        if !trusted_directory(
+                            &next.metadata().map_err(|_| "journal_metadata_failed")?,
+                            agent,
+                        ) {
+                            return Err("untrusted_journal_ancestor");
+                        }
+                        dirs.push(next);
+                    }
+                }
+                let leaf = dirs
+                    .last()
+                    .ok_or("journal_anchor_missing")?
+                    .metadata()
+                    .map_err(|_| "journal_metadata_failed")?;
+                if !private_directory(&leaf, agent) {
+                    return Err("unsafe_agent_home");
+                }
+                let anchor = Self {
+                    path: home.to_owned(),
+                    dirs,
+                    agent,
+                };
+                anchor.validate()?;
+                Ok(anchor)
+            }
+
+            fn home(&self) -> Result<&File, &'static str> {
+                self.dirs.last().ok_or("journal_anchor_missing")
+            }
+
+            fn validate(&self) -> Result<(), &'static str> {
+                // Rewalk with no-follow and compare each inode to the held chain.
+                let mut current = directory(Path::new("/"))?;
+                let mut index = 1;
+                for part in self.path.components() {
+                    if let Component::Normal(name) = part {
+                        current = directory(&relative(&current, name))?;
+                        let actual = current.metadata().map_err(|_| "journal_metadata_failed")?;
+                        let expected = self
+                            .dirs
+                            .get(index)
+                            .ok_or("journal_anchor_missing")?
+                            .metadata()
+                            .map_err(|_| "journal_metadata_failed")?;
+                        if actual.dev() != expected.dev()
+                            || actual.ino() != expected.ino()
+                            || !trusted_directory(&actual, self.agent)
+                        {
+                            return Err("journal_ancestor_replaced");
+                        }
+                        index += 1;
+                    }
+                }
+                if !private_directory(
+                    &current.metadata().map_err(|_| "journal_metadata_failed")?,
+                    self.agent,
+                ) {
+                    return Err("unsafe_agent_home");
+                }
+                Ok(())
+            }
+        }
+
+        /// A durable reservation anchored to a private, canonical agent-state HOME.
+        pub struct Reservation {
+            file: File,
+            dir: File,
+            anchor: Anchor,
+            journal_name: std::ffi::OsString,
+            name: std::ffi::OsString,
+        }
+
+        impl Reservation {
+            /// Atomically reserve a batch through held no-follow directory descriptors.
+            /// Every error is indeterminate and must stop model/tool execution.
+            pub fn acquire(path: &Path, identity: &str) -> Result<Self, &'static str> {
+                let home = path.parent().ok_or("journal_parent_missing")?;
+                let journal_name = path.file_name().ok_or("journal_name_missing")?.to_owned();
+                if path.components().collect::<PathBuf>().as_os_str() != path.as_os_str() {
+                    return Err("noncanonical_journal_path");
+                }
+                let anchor = Anchor::open(home)?;
+                let journal_path = relative(anchor.home()?, &journal_name);
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                match builder.create(&journal_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err("journal_directory_failed"),
+                }
+                let dir = directory(&journal_path)?;
+                if !private_directory(
+                    &dir.metadata().map_err(|_| "journal_metadata_failed")?,
+                    anchor.agent,
+                ) {
+                    return Err("unsafe_journal_directory");
+                }
+                let name: std::ffi::OsString =
+                    hex::encode(Sha256::digest(identity.as_bytes())).into();
+                let entry = relative(&dir, &name);
+                // Replay detection precedes capacity. A malformed/hardlinked existing
+                // record is also indeterminate, never permission to rerun the model.
+                match std::fs::symlink_metadata(&entry) {
+                    Ok(meta) => {
+                        return Err(if record(&meta, anchor.agent) {
+                            "batch_already_reserved"
+                        } else {
+                            "unsafe_existing_record"
+                        })
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err("journal_lookup_failed"),
+                }
+                let entries = std::fs::read_dir(relative(&dir, std::ffi::OsStr::new(".")))
+                    .map_err(|_| "journal_read_failed")?;
+                let mut count = 0;
+                for entry in entries.take(4096) {
+                    entry.map_err(|_| "journal_read_failed")?;
+                    count += 1;
+                }
+                if count >= 4096 {
+                    return Err("journal_capacity");
+                }
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(
+                        nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK,
+                    )
+                    .open(&entry)
+                    .map_err(|_| "reserved_or_journal_failed")?;
+                let reservation = Self {
+                    file,
+                    dir,
+                    anchor,
+                    journal_name,
+                    name,
+                };
+                reservation.validate()?;
+                reservation
+                    .file
+                    .sync_all()
+                    .map_err(|_| "journal_sync_failed")?;
+                reservation
+                    .dir
+                    .sync_all()
+                    .map_err(|_| "journal_sync_failed")?;
+                reservation
+                    .anchor
+                    .home()?
+                    .sync_all()
+                    .map_err(|_| "journal_sync_failed")?;
+                Ok(reservation)
+            }
+
+            fn validate(&self) -> Result<(), &'static str> {
+                self.anchor.validate()?;
+                let held_dir = self.dir.metadata().map_err(|_| "journal_metadata_failed")?;
+                let linked_dir =
+                    std::fs::symlink_metadata(relative(self.anchor.home()?, &self.journal_name))
+                        .map_err(|_| "journal_metadata_failed")?;
+                if held_dir.dev() != linked_dir.dev()
+                    || held_dir.ino() != linked_dir.ino()
+                    || !private_directory(&linked_dir, self.anchor.agent)
+                {
+                    return Err("journal_directory_replaced");
+                }
+                let held = self
+                    .file
+                    .metadata()
+                    .map_err(|_| "journal_metadata_failed")?;
+                let linked = std::fs::symlink_metadata(relative(&self.dir, &self.name))
+                    .map_err(|_| "journal_metadata_failed")?;
+                if !record(&held, self.anchor.agent)
+                    || !record(&linked, self.anchor.agent)
+                    || held.dev() != linked.dev()
+                    || held.ino() != linked.ino()
+                {
+                    return Err("unsafe_journal_record");
+                }
+                Ok(())
+            }
+
+            pub(super) fn persist(&mut self, event: &Event) -> Result<(), &'static str> {
+                self.validate()?;
+                if self
+                    .file
+                    .metadata()
+                    .map_err(|_| "journal_metadata_failed")?
+                    .len()
+                    != 0
+                {
+                    return Err("journal_record_changed");
+                }
+                let data = serde_json::to_vec(event).map_err(|_| "journal_encode_failed")?;
+                if data.len() as u64 > MAX_RECORD {
+                    return Err("journal_record_overflow");
+                }
+                self.file
+                    .write_all(&data)
+                    .and_then(|_| self.file.sync_all())
+                    .map_err(|_| "journal_sync_failed")?;
+                self.validate()
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            #[test]
+            fn actual_metadata_wrong_owner_is_rejected() {
+                let path = std::env::temp_dir()
+                    .canonicalize()
+                    .unwrap()
+                    .join(format!("buzz-owner-{}", Uuid::new_v4()));
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .unwrap();
+                let meta = std::fs::metadata(&path).unwrap();
+                assert!(private_directory(&meta, uid().unwrap()));
+                assert!(!private_directory(&meta, meta.uid().wrapping_add(1)));
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path.join("record"))
+                    .unwrap();
+                let meta = file.metadata().unwrap();
+                assert!(record(&meta, uid().unwrap()));
+                assert!(!record(&meta, meta.uid().wrapping_add(1)));
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub use journal::Reservation;
+
+    /// Unsupported systems cannot establish the directory-relative state boundary.
+    #[cfg(not(target_os = "linux"))]
+    pub struct Reservation;
+    #[cfg(not(target_os = "linux"))]
+    impl Reservation {
+        /// Fail closed without creating or opening state on unsupported platforms.
+        pub fn acquire(_: &Path, _: &str) -> Result<Self, &'static str> {
+            Err("private_journal_unsupported")
+        }
+        fn persist(&mut self, _: &Event) -> Result<(), &'static str> {
+            Err("private_journal_unsupported")
+        }
+    }
+
+    /// A bounded pre-turn snapshot prevents old flat-thread replies satisfying this turn.
+    pub struct Delivery {
+        destination: Destination,
+        author: PublicKey,
+        since: u64,
+        baseline: HashSet<EventId>,
+        reservation: Reservation,
+    }
+
+    impl Delivery {
+        fn filter(&self) -> Value {
+            let mut filter = json!({"kinds":[9],"authors":[self.author.to_hex()],"#h":[self.destination.channel.to_string()],"since":self.since,"limit":32});
+            if let Some(root) = self.destination.root {
+                filter["#e"] = json!([root.to_hex()]);
+            }
+            filter
+        }
+
+        fn events(&self, value: Value) -> Result<Vec<Event>, &'static str> {
+            let array = value.as_array().ok_or("invalid_query_shape")?;
+            if array.len() >= 32 {
+                return Err("query_truncated");
+            }
+            let mut events = Vec::new();
+            for value in array {
+                let e: Event =
+                    serde_json::from_value(value.clone()).map_err(|_| "invalid_query_event")?;
+                e.verify().map_err(|_| "invalid_query_signature")?;
+                if e.pubkey != self.author
+                    || e.kind != Kind::Custom(9)
+                    || e.created_at.as_secs() < self.since
+                {
+                    return Err("query_filter_mismatch");
+                }
+                if !self.destination.conversation_matches(&e) {
+                    return Err("query_conversation_conflict");
+                }
+                events.push(e);
+            }
+            Ok(events)
+        }
+
+        /// Snapshot accepted replies before the prompt. Query failure disables fallback.
+        pub async fn begin(
+            transport: &impl Transport,
+            destination: Destination,
+            keys: &Keys,
+            reservation: Reservation,
+        ) -> Result<Self, &'static str> {
+            if destination.root.is_some() != destination.parent.is_some() {
+                return Err("incomplete_destination");
+            }
+            let mut delivery = Self {
+                destination,
+                author: keys.public_key(),
+                since: Timestamp::now().as_secs().saturating_sub(1),
+                baseline: HashSet::new(),
+                reservation,
+            };
+            let events = delivery.events(transport.query(delivery.filter()).await?)?;
+            delivery.baseline.extend(events.into_iter().map(|e| e.id));
+            Ok(delivery)
+        }
+
+        /// Complete delivery after actual EndTurn. Never resubmit or rerun tools on ACK loss.
+        pub async fn finish(
+            self,
+            transport: &impl Transport,
+            keys: &Keys,
+            final_text: Result<String, &'static str>,
+        ) -> Outcome {
+            self.finish_with_control(transport, keys, final_text, &mut None, &mut None)
+                .await
+        }
+
+        /// Retain turn control through the pre-submit commit boundary. After submit starts,
+        /// cancellation cannot undo a relay effect; always reconcile the same signed ID.
+        pub(crate) async fn finish_with_control(
+            mut self,
+            transport: &impl Transport,
+            keys: &Keys,
+            final_text: Result<String, &'static str>,
+            control: &mut Option<tokio::sync::oneshot::Receiver<super::ControlSignal>>,
+            received: &mut Option<super::ControlSignal>,
+        ) -> Outcome {
+            if keys.public_key() != self.author {
+                return Outcome::Failed("signer_changed");
+            }
+            let text = match final_text {
+                Ok(t) => t,
+                Err(e) => return Outcome::Failed(e),
+            };
+            let queried = tokio::select! {
+                biased;
+                _ = cancelled(control, received) => return Outcome::Failed("cancelled_before_submit"),
+                value = transport.query(self.filter()) => value,
+            };
+            let events = match queried.and_then(|v| self.events(v)) {
+                Ok(e) => e,
+                Err(e) => return Outcome::Uncertain(e),
+            };
+            if let Some(e) = events.iter().find(|e| !self.baseline.contains(&e.id)) {
+                return Outcome::Existing(e.id);
+            }
+            if is_silence(&text) {
+                return Outcome::Silent;
+            }
+            let event = match self.destination.build(&text, keys) {
+                Ok(e) => e,
+                Err(e) => return Outcome::Failed(e),
+            };
+            if let Err(e) = self.reservation.persist(&event) {
+                return Outcome::Uncertain(e);
+            }
+            // No await between this cancellation check and the first poll of submit.
+            // This is the publication commit boundary. Never drop the submit future
+            // on cancellation: its side effect may already have reached the relay.
+            if control_pending(control, received) {
+                return Outcome::Failed("cancelled_before_submit");
+            }
+            let ack = transport.submit(&event).await;
+            if let Ok(value) = &ack {
+                if value["event_id"].as_str() == Some(event.id.to_hex().as_str()) {
+                    match value["accepted"].as_bool() {
+                        Some(true) => return Outcome::Accepted(event.id),
+                        Some(false) => return Outcome::Failed("relay_rejected"),
+                        None => {}
+                    }
+                }
+            }
+            // A missing/unknown ACK is not success. Query the SAME ID, without a second POST.
+            let value = match transport
+                .query(json!({"ids":[event.id.to_hex()],"kinds":[9],"authors":[self.author.to_hex()],"#h":[self.destination.channel.to_string()],"limit":2}))
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Outcome::Uncertain(e),
+            };
+            let Some(array) = value.as_array() else {
+                return Outcome::Uncertain("invalid_readback");
+            };
+            if array.len() != 1 {
+                return Outcome::Uncertain("acceptance_unconfirmed");
+            }
+            match serde_json::from_value::<Event>(array[0].clone()) {
+                Ok(found) if found == event && found.verify().is_ok() => {
+                    Outcome::Accepted(event.id)
+                }
+                _ => Outcome::Uncertain("acceptance_unconfirmed"),
+            }
+        }
+    }
+
+    async fn cancelled(
+        control: &mut Option<tokio::sync::oneshot::Receiver<super::ControlSignal>>,
+        received: &mut Option<super::ControlSignal>,
+    ) {
+        match control.as_mut() {
+            Some(rx) => {
+                *received = Some(rx.await.unwrap_or(super::ControlSignal::Cancel));
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    fn control_pending(
+        control: &mut Option<tokio::sync::oneshot::Receiver<super::ControlSignal>>,
+        received: &mut Option<super::ControlSignal>,
+    ) -> bool {
+        match control.as_mut().map(|rx| rx.try_recv()) {
+            None | Some(Err(tokio::sync::oneshot::error::TryRecvError::Empty)) => false,
+            Some(result) => {
+                *received = Some(result.unwrap_or(super::ControlSignal::Cancel));
+                true
+            }
+        }
+    }
+
+    /// Explicit no-output markers are never sent as user-facing channel messages.
+    pub fn is_silence(text: &str) -> bool {
+        matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "" | "no_reply"
+                | "no_response"
+                | "silent"
+                | "[silent]"
+                | "[silence]"
+                | "(silence)"
+                | "heartbeat_ok"
+        )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod reply_delivery_lifecycle_tests {
+    use super::*;
+    use nostr::{Event, EventBuilder, Keys, Kind, Tag};
+    use serde_json::{json, Value};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Semaphore;
+
+    struct Home(PathBuf);
+    impl Home {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("buzz-r2-{}", Uuid::new_v4()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Home {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    struct Wire {
+        duplicate_queries: AtomicUsize,
+        posts: Mutex<Vec<Event>>,
+        readbacks: Mutex<Vec<String>>,
+        pause_query: bool,
+        pause_submit: bool,
+        nested: Option<Event>,
+        profile: Option<Event>,
+        reached: Semaphore,
+        release: Semaphore,
+    }
+
+    impl Default for Wire {
+        fn default() -> Self {
+            Self {
+                duplicate_queries: AtomicUsize::new(0),
+                posts: Mutex::new(Vec::new()),
+                readbacks: Mutex::new(Vec::new()),
+                pause_query: false,
+                pause_submit: false,
+                nested: None,
+                profile: None,
+                reached: Semaphore::new(0),
+                release: Semaphore::new(0),
+            }
+        }
+    }
+
+    async fn server(wire: Arc<Wire>) -> (RestClient, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let wire = wire.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let header_end = loop {
+                        let mut chunk = [0; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                        assert!(bytes.len() < 512 * 1024);
+                        if let Some(i) = bytes.windows(4).position(|p| p == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|s| s.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    while bytes.len() < header_end + length {
+                        let mut chunk = [0; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                    }
+                    assert!(head.to_ascii_lowercase().contains("authorization: nostr "));
+                    let body: Value =
+                        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    let response = if head.starts_with("POST /events ") {
+                        let event: Event = serde_json::from_value(body).unwrap();
+                        assert!(event.verify().is_ok());
+                        if event.kind == Kind::Custom(9) {
+                            wire.posts.lock().unwrap().push(event.clone());
+                            if wire.pause_submit {
+                                wire.reached.add_permits(1);
+                                wire.release.acquire().await.unwrap().forget();
+                                None // Effect accepted, HTTP acknowledgement lost/malformed.
+                            } else {
+                                Some(json!({"event_id":event.id.to_hex(),"accepted":true}))
+                            }
+                        } else {
+                            Some(json!({"event_id":event.id.to_hex(),"accepted":true}))
+                        }
+                    } else {
+                        let filter = &body[0];
+                        if let Some(id) = filter["ids"][0].as_str() {
+                            wire.readbacks.lock().unwrap().push(id.to_owned());
+                            Some(json!(wire
+                                .posts
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|e| e.id.to_hex() == id)
+                                .collect::<Vec<_>>()))
+                        } else if filter["kinds"][0] == 9 && filter.get("#h").is_some() {
+                            let n = wire.duplicate_queries.fetch_add(1, Ordering::SeqCst);
+                            if n == 1 && wire.pause_query {
+                                wire.reached.add_permits(1);
+                                wire.release.acquire().await.unwrap().forget();
+                            }
+                            Some(if n > 0 {
+                                json!(wire.nested.iter().collect::<Vec<_>>())
+                            } else {
+                                json!([])
+                            })
+                        } else if filter["kinds"][0] == 0 {
+                            Some(json!(wire.profile.iter().collect::<Vec<_>>()))
+                        } else {
+                            Some(json!([]))
+                        }
+                    };
+                    let body = response.map(|v| v.to_string()).unwrap_or_default();
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    socket.write_all(response.as_bytes()).await.ok();
+                });
+            }
+        });
+        (
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: format!("http://{address}"),
+                keys: Keys::generate(),
+                auth_tag_json: None,
+            },
+            task,
+        )
+    }
+
+    fn trigger(sender: &Keys, channel: Uuid, root: Option<nostr::EventId>) -> Event {
+        let mut tags = vec![Tag::parse(["h", &channel.to_string()]).unwrap()];
+        if let Some(root) = root {
+            tags.push(Tag::parse(["e", &root.to_hex(), "", "reply"]).unwrap());
+        }
+        EventBuilder::new(Kind::Custom(9), "fixture human request")
+            .tags(tags)
+            .sign_with_keys(sender)
+            .unwrap()
+    }
+
+    async fn agent(home: &Home) -> OwnedAgent {
+        let script = r#"
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> "$TEST_REQUESTS"
+  if [[ $request =~ \"id\":([0-9]+) ]]; then
+    rpc_id=${BASH_REMATCH[1]}
+    if [[ $request == *'"method":"session/prompt"'* ]]; then
+      printf 'tool\n' >> "$TEST_TOOLS"
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"final fixture answer"}}}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$rpc_id"
+    else
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s"}}\n' "$rpc_id"
+    fi
+  fi
+done
+"#;
+        let env = vec![
+            (
+                "TEST_REQUESTS".into(),
+                home.0.join("requests").to_str().unwrap().to_owned(),
+            ),
+            (
+                "TEST_TOOLS".into(),
+                home.0.join("tools").to_str().unwrap().to_owned(),
+            ),
+        ];
+        OwnedAgent {
+            index: 0,
+            acp: AcpClient::spawn("bash", &["-c".into(), script.into()], &env, false)
+                .await
+                .unwrap(),
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "fixture".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    fn context(
+        home: &Home,
+        rest: RestClient,
+        keys: &Keys,
+        owner: &Keys,
+        channel: Uuid,
+        kind: &str,
+    ) -> Arc<PromptContext> {
+        Arc::new(PromptContext {
+            mcp_servers: vec![],
+            initial_message: Some("initial fixture".into()),
+            idle_timeout: Duration::from_secs(3),
+            max_turn_duration: Duration::from_secs(10),
+            turn_liveness_interval: Duration::ZERO,
+            dedup_mode: DedupMode::Drop,
+            system_prompt: None,
+            session_title: None,
+            team_instructions: None,
+            heartbeat_prompt: None,
+            base_prompt: None,
+            cwd: home.0.to_str().unwrap().into(),
+            reply_state_home: Some(home.0.clone()),
+            channel_info: ChannelInfoResolver::new(
+                HashMap::from([(
+                    channel,
+                    ChannelInfo {
+                        name: "fixture".into(),
+                        channel_type: kind.into(),
+                    },
+                )]),
+                rest.clone(),
+            ),
+            rest_client: rest,
+            context_message_limit: 0,
+            max_turns_per_session: 0,
+            permission_mode: PermissionMode::Default,
+            agent_keys: keys.clone(),
+            agent_owner_pubkey: Some(owner.public_key()),
+            memory_enabled: false,
+            harness_name: "fixture".into(),
+            relay_url: "ws://127.0.0.1:0".into(),
+        })
+    }
+
+    async fn turn(
+        home: &Home,
+        ctx: Arc<PromptContext>,
+        event: Event,
+        control: tokio::sync::oneshot::Receiver<ControlSignal>,
+    ) -> (JoinHandle<()>, mpsc::UnboundedReceiver<PromptResult>) {
+        let channel = Uuid::parse_str(
+            &event
+                .tags
+                .iter()
+                .find(|t| t.as_slice()[0] == "h")
+                .unwrap()
+                .as_slice()[1],
+        )
+        .unwrap();
+        let batch = FlushBatch {
+            channel_id: channel,
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let agent = agent(home).await;
+        (
+            tokio::spawn(run_prompt_task(
+                agent,
+                Some(batch),
+                None,
+                ctx,
+                tx,
+                Some(control),
+                "lifecycle".into(),
+            )),
+            rx,
+        )
+    }
+
+    fn prompt_count(home: &Home) -> usize {
+        std::fs::read_to_string(home.0.join("requests"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("session/prompt"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn full_journal_existing_batch_runs_zero_initial_main_prompts_or_tools() {
+        let home = Home::new();
+        let keys = Keys::generate();
+        let owner = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event = trigger(&owner, ch, None);
+        let journal = home.0.join(".buzz-acp-reply-delivery-v1");
+        let identity = format!("{}:{}:{:?}", keys.public_key(), ch, vec![event.id.to_hex()]);
+        drop(reply_delivery::Reservation::acquire(&journal, &identity).unwrap());
+        for n in 0..4095 {
+            std::fs::write(journal.join(format!("capacity-{n}")), []).unwrap();
+        }
+        let wire = Arc::new(Wire::default());
+        let (rest, server) = server(wire.clone()).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (task, mut results) = turn(
+            &home,
+            context(&home, rest.clone(), &keys, &owner, ch, "stream"),
+            event,
+            rx,
+        )
+        .await;
+        task.await.unwrap();
+        let result = results.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::Cancelled)
+        ));
+        drop(tx);
+        // A different, unreserved batch at the same capacity is indeterminate too.
+        let next_channel = Uuid::new_v4();
+        let next_event = trigger(&owner, next_channel, None);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (task, mut results) = turn(
+            &home,
+            context(&home, rest, &keys, &owner, next_channel, "stream"),
+            next_event,
+            rx,
+        )
+        .await;
+        task.await.unwrap();
+        let result = results.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::Cancelled)
+        ));
+        drop(tx);
+        assert_eq!(prompt_count(&home), 0);
+        assert!(!home.0.join("tools").exists());
+        assert!(wire.posts.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_during_post_end_turn_query_submits_nothing() {
+        let home = Home::new();
+        let keys = Keys::generate();
+        let owner = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event = trigger(&owner, ch, None);
+        let wire = Arc::new(Wire {
+            pause_query: true,
+            ..Wire::default()
+        });
+        let (rest, server) = server(wire.clone()).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (task, mut results) = turn(
+            &home,
+            context(&home, rest, &keys, &owner, ch, "stream"),
+            event,
+            rx,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), wire.reached.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        tx.send(ControlSignal::Cancel).unwrap();
+        wire.release.add_permits(1);
+        task.await.unwrap();
+        let _result = results.recv().await.unwrap();
+        assert_eq!(prompt_count(&home), 2);
+        assert!(wire.posts.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_after_submit_reconciles_same_id_without_model_or_tool_replay() {
+        let home = Home::new();
+        let keys = Keys::generate();
+        let owner = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event = trigger(&owner, ch, None);
+        let wire = Arc::new(Wire {
+            pause_submit: true,
+            ..Wire::default()
+        });
+        let (rest, server) = server(wire.clone()).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (task, mut results) = turn(
+            &home,
+            context(&home, rest, &keys, &owner, ch, "stream"),
+            event,
+            rx,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), wire.reached.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let id = wire.posts.lock().unwrap()[0].id.to_hex();
+        tx.send(ControlSignal::Cancel).unwrap();
+        wire.release.add_permits(1);
+        task.await.unwrap();
+        let result = results.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        assert_eq!(wire.posts.lock().unwrap().len(), 1);
+        assert_eq!(*wire.readbacks.lock().unwrap(), vec![id]);
+        assert_eq!(prompt_count(&home), 2);
+        assert_eq!(
+            std::fs::read_to_string(home.0.join("tools"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nested_signed_cli_and_dm_parent_variants_suppress_fallback_in_production() {
+        for kind in ["stream", "dm"] {
+            let home = Home::new();
+            let keys = Keys::generate();
+            let owner = Keys::generate();
+            let ch = Uuid::new_v4();
+            let root = nostr::EventId::all_zeros();
+            let event = trigger(&owner, ch, Some(root));
+            let parent = trigger(&owner, ch, None).id;
+            let nested = buzz_sdk::builders::build_message(
+                ch,
+                "CLI accepted",
+                Some(&buzz_sdk::ThreadRef {
+                    root_event_id: root,
+                    parent_event_id: parent,
+                }),
+                &[],
+                false,
+                &[],
+            )
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap();
+            let wire = Arc::new(Wire {
+                nested: Some(nested),
+                ..Wire::default()
+            });
+            let (rest, server) = server(wire.clone()).await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (task, mut results) = turn(
+                &home,
+                context(&home, rest, &keys, &owner, ch, kind),
+                event,
+                rx,
+            )
+            .await;
+            task.await.unwrap();
+            let _result = results.recv().await.unwrap();
+            drop(tx);
+            assert_eq!(prompt_count(&home), 2);
+            assert!(wire.posts.lock().unwrap().is_empty());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_profile_without_auth_does_not_authorize_agent_fallback() {
+        let home = Home::new();
+        let keys = Keys::generate();
+        let owner = Keys::generate();
+        let untrusted = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event = trigger(&untrusted, ch, None);
+        let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"agent without auth"}"#)
+            .sign_with_keys(&untrusted)
+            .unwrap();
+        let lookup = parse_kind0_profile_lookup(json!([profile])).unwrap();
+        assert!(!lookup[&untrusted.public_key().to_hex()].is_agent);
+        let wire = Arc::new(Wire {
+            profile: Some(profile),
+            ..Wire::default()
+        });
+        let (rest, server) = server(wire.clone()).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (task, mut results) = turn(
+            &home,
+            context(&home, rest, &keys, &owner, ch, "stream"),
+            event,
+            rx,
+        )
+        .await;
+        task.await.unwrap();
+        let _result = results.recv().await.unwrap();
+        drop(tx);
+        assert_eq!(prompt_count(&home), 2);
+        assert!(wire.posts.lock().unwrap().is_empty());
+        assert!(!home.0.join(".buzz-acp-reply-delivery-v1").exists());
         server.abort();
     }
 }
